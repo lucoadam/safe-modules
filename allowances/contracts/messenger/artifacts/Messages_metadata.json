@@ -1,0 +1,46 @@
+{
+	"compiler": {
+		"version": "0.8.0+commit.c7dfd78e"
+	},
+	"language": "Solidity",
+	"output": {
+		"abi": [],
+		"devdoc": {
+			"kind": "dev",
+			"methods": {},
+			"title": "Messages",
+			"version": 1
+		},
+		"userdoc": {
+			"kind": "user",
+			"methods": {},
+			"version": 1
+		}
+	},
+	"settings": {
+		"compilationTarget": {
+			"messenger/Messages.sol": "Messages"
+		},
+		"evmVersion": "istanbul",
+		"libraries": {},
+		"metadata": {
+			"bytecodeHash": "ipfs"
+		},
+		"optimizer": {
+			"enabled": true,
+			"runs": 200
+		},
+		"remappings": []
+	},
+	"sources": {
+		"messenger/Messages.sol": {
+			"keccak256": "0xe7cf90895bba1d3db6a73895a78e2d53f4f8478f42419e256565bc0a6f8623c2",
+			"license": "Apache 2",
+			"urls": [
+				"bzz-raw://b9e2355545fa451628cf1511cd41f1e693054634cfaae6a2b27bcc1a2c2da7ae",
+				"dweb:/ipfs/QmZcnUBzJKYmXPsPu3jS5QXjNsbTABS7v5bumHGusGbK4U"
+			]
+		}
+	},
+	"version": 1
+}
