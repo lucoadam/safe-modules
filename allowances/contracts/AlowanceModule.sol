@@ -4,7 +4,6 @@ pragma solidity 0.8.0;
 import "./Enum.sol";
 import "./SignatureDecoder.sol";
 
-import "./messenger/Messenger.sol";
 import "./messenger/interfaces/IWETH.sol";
 
 interface GnosisSafe {
@@ -18,6 +17,14 @@ interface GnosisSafe {
         returns (bool success);
 }
 
+interface IMessenger {
+
+     function initialize_token_account(
+        bytes memory account,
+        bytes memory token_mint
+    ) external payable; 
+}
+
 contract AllowanceModule is SignatureDecoder {
 
     string public constant NAME = "Allowance Module";
@@ -28,13 +35,13 @@ contract AllowanceModule is SignatureDecoder {
     //     "EIP712Domain(uint256 chainId,address verifyingContract)"
     // );
 
-    bytes32 public constant ALLOWANCE_TRANSFER_TYPEHASH = 0x80b006280932094e7cc965863eb5118dc07e5d272c6670c4a7c87299e04fceeb;
+    bytes32 public constant ALLOWANCE_TRANSFER_TYPEHASH = 0x4dd1b7a6ebcbe5bda29f795e91a51fe9556ef167114f25e583872a60fa8a4886;
     // keccak256(
     //     "AllowanceTransfer(address safe,address token,uint256 amount,uint16 nonce)"
     // );
 
     //Proxy Contract
-    Messenger public messenger;
+    IMessenger public messenger;
     //WBNB Contract 
     IWETH public weth;
 
@@ -71,6 +78,11 @@ contract AllowanceModule is SignatureDecoder {
     event SetAllowance(address indexed safe, address delegate, address token, uint96 allowanceAmount, uint16 resetTime);
     event ResetAllowance(address indexed safe, address delegate, address token);
     event DeleteAllowance(address indexed safe, address delegate, address token);
+
+    constructor (address _messenger, address _wbnb){
+        messenger = IMessenger(_messenger);
+        weth = IWETH(_wbnb);
+    } 
 
     /// @dev Allows to update the allowance for a specified token. This can only be done via a Safe transaction.
     /// @param delegate Delegate whose allowance should be updated.
@@ -223,22 +235,20 @@ contract AllowanceModule is SignatureDecoder {
         address token,
         uint256 amount,
         uint16 nonce
-    ) private view returns (bytes memory) {
+    ) public view returns (bytes memory) {
         uint256 chainId = getChainId();
         bytes32 domainSeparator = keccak256(abi.encode(DOMAIN_SEPARATOR_TYPEHASH, chainId, this));
         bytes32 transferHash = keccak256(
-            abi.encode(ALLOWANCE_TRANSFER_TYPEHASH, safe, token, address(messenger), amount, nonce)
+            abi.encode(ALLOWANCE_TRANSFER_TYPEHASH, safe, token, amount, nonce)
         );
-        return abi.encodePacked(domainSeparator, transferHash);
+        return abi.encodePacked("\x19\x01",domainSeparator,transferHash);
     }
 
     /// @dev Generates the transfer hash that should be signed to authorize a transfer
     function generateTransferHash(
         address safe,
         address token,
-        address to,
         uint256 amount,
-        uint96 payment,
         uint16 nonce
     ) public view returns (bytes32) {
         return keccak256(generateTransferHashData(
@@ -246,11 +256,11 @@ contract AllowanceModule is SignatureDecoder {
         ));
     }
 
-    function checkSignature(address expectedDelegate, bytes memory signature, bytes memory transferHashData, GnosisSafe safe) private view {
+    function checkSignature(address expectedDelegate, bytes memory signature, bytes memory transferHashData, GnosisSafe safe) public view {
         address signer = recoverSignature(signature, transferHashData);
         require(
             expectedDelegate == signer && delegates[address(safe)][signer].delegate == signer,
-            "expectedDelegate == signer && delegates[address(safe)][uint48(signer)].delegate == signer"
+            "expectedDelegate == signer && delegates[address(safe)][signer].delegate == signer"
         );
     }
 
