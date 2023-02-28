@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: LGPL-3.0-only
-pragma solidity >=0.7.0 <0.8.0;
+pragma solidity 0.8.0;
 
 import "./Enum.sol";
 import "./SignatureDecoder.sol";
+
+import "./messenger/interfaces/IWETH.sol";
 
 interface GnosisSafe {
     /// @dev Allows a Module to execute a Safe transaction without any further confirmations.
@@ -15,6 +17,14 @@ interface GnosisSafe {
         returns (bool success);
 }
 
+interface IMessenger {
+
+     function initialize_token_account(
+        bytes memory account,
+        bytes memory token_mint
+    ) external payable; 
+}
+
 contract AllowanceModule is SignatureDecoder {
 
     string public constant NAME = "Allowance Module";
@@ -25,32 +35,37 @@ contract AllowanceModule is SignatureDecoder {
     //     "EIP712Domain(uint256 chainId,address verifyingContract)"
     // );
 
-    bytes32 public constant ALLOWANCE_TRANSFER_TYPEHASH = 0x80b006280932094e7cc965863eb5118dc07e5d272c6670c4a7c87299e04fceeb;
+    bytes32 public constant ALLOWANCE_TRANSFER_TYPEHASH = 0x4dd1b7a6ebcbe5bda29f795e91a51fe9556ef167114f25e583872a60fa8a4886;
     // keccak256(
-    //     "AllowanceTransfer(address safe,address token,uint96 amount,address paymentToken,uint96 payment,uint16 nonce)"
+    //     "AllowanceTransfer(address safe,address token,uint256 amount,uint16 nonce)"
     // );
+
+    //Proxy Contract
+    IMessenger public messenger;
+    //WBNB Contract 
+    IWETH public weth;
 
     // Safe -> Delegate -> Allowance
     mapping(address => mapping (address => mapping(address => Allowance))) public allowances;
     // Safe -> Delegate -> Tokens
     mapping(address => mapping (address => address[])) public tokens;
     // Safe -> Delegates double linked list entry points
-    mapping(address => uint48) public delegatesStart;
+    mapping(address => address) public delegatesStart;
     // Safe -> Delegates double linked list
-    mapping(address => mapping (uint48 => Delegate)) public delegates;
+    mapping(address => mapping (address => Delegate)) public delegates;
 
     // We use a double linked list for the delegates. The id is the first 6 bytes. 
     // To double check the address in case of collision, the address is part of the struct.
     struct Delegate {
         address delegate;
-        uint48 prev;
-        uint48 next;
+        address prev;
+        address next;
     }
 
     // The allowance info is optimized to fit into one word of storage.
     struct Allowance {
-        uint96 amount;
-        uint96 spent;
+        uint256 amount;
+        uint256 spent;
         uint16 resetTimeMin; // Maximum reset time span is 65k minutes
         uint32 lastResetMin;
         uint16 nonce;
@@ -58,11 +73,16 @@ contract AllowanceModule is SignatureDecoder {
 
     event AddDelegate(address indexed safe, address delegate);
     event RemoveDelegate(address indexed safe, address delegate);
-    event ExecuteAllowanceTransfer(address indexed safe, address delegate, address token, address to, uint96 value, uint16 nonce);
-    event PayAllowanceTransfer(address indexed safe, address delegate, address paymentToken, address paymentReceiver, uint96 payment);
+    event ExecuteAllowanceTransfer(address indexed safe, address delegate, address token, address to, uint256 value, uint16 nonce);
+    event InitializeTokenAccount(address indexed safe, bytes token_mint, address delegate, address paymentReceiver, uint256 payment );
     event SetAllowance(address indexed safe, address delegate, address token, uint96 allowanceAmount, uint16 resetTime);
     event ResetAllowance(address indexed safe, address delegate, address token);
     event DeleteAllowance(address indexed safe, address delegate, address token);
+
+    constructor (address _messenger, address _wbnb){
+        messenger = IMessenger(_messenger);
+        weth = IWETH(_wbnb);
+    } 
 
     /// @dev Allows to update the allowance for a specified token. This can only be done via a Safe transaction.
     /// @param delegate Delegate whose allowance should be updated.
@@ -74,7 +94,7 @@ contract AllowanceModule is SignatureDecoder {
         public
     {
         require(delegate != address(0), "delegate != address(0)");
-        require(delegates[msg.sender][uint48(delegate)].delegate == delegate, "delegates[msg.sender][uint48(delegate)].delegate == delegate");
+        require(delegates[msg.sender][delegate].delegate == delegate, "delegates[msg.sender][(uint256(delegate) >> 208)].delegate == delegate");
         Allowance memory allowance = getAllowance(msg.sender, delegate, token);
         if (allowance.nonce == 0) { // New token
             // Nonce should never be 0 once allowance has been activated
@@ -141,62 +161,66 @@ contract AllowanceModule is SignatureDecoder {
     /// @dev Allows to use the allowance to perform a transfer.
     /// @param safe The Safe whose funds should be used.
     /// @param token Token contract address.
-    /// @param to Address that should receive the tokens.
-    /// @param amount Amount that should be transferred.
-    /// @param paymentToken Token that should be used to pay for the execution of the transfer.
-    /// @param payment Amount to should be paid for executing the transfer.
+    /// @param token_mint Token Account that needs to be initialized
     /// @param delegate Delegate whose allowance should be updated.
     /// @param signature Signature generated by the delegate to authorize the transfer.
-    function executeAllowanceTransfer(
+    function executeTokenAccountInitialization(
         GnosisSafe safe,
         address token,
-        address payable to,
-        uint96 amount,
-        address paymentToken,
-        uint96 payment,
+        bytes memory token_mint,
         address delegate,
         bytes memory signature
-    ) public {
+    ) public payable{
         // Get current state
         Allowance memory allowance = getAllowance(address(safe), delegate, token);
-        bytes memory transferHashData = generateTransferHashData(address(safe), token, to, amount, paymentToken, payment, allowance.nonce);
 
         // Update state
         allowance.nonce = allowance.nonce + 1;
-        uint96 newSpent = allowance.spent + amount;
+
+        //Get Total Fee
+        // uint256 wormholeFee = messenger._wormhole.messageFee();
+        uint256 wormholeFee =0;
+        // uint256 arbiterFee = messenger._arbiter_fee;
+        uint256 arbiterFee =100;
+        uint256 amount = wormholeFee+arbiterFee;
+
+        bytes memory transferHashData = generateTransferHashData(address(safe), token, amount, allowance.nonce);
+
+        //Check for value  
+        require(msg.value >= amount, "Value less then amount");
+
+        uint256 newSpent = allowance.spent + amount;
         // Check new spent amount and overflow
         require(newSpent > allowance.spent && newSpent <= allowance.amount, "newSpent > allowance.spent && newSpent <= allowance.amount");
         allowance.spent = newSpent;
-        if (payment > 0) {
-            // Use updated allowance if token and paymentToken are the same
-            Allowance memory paymentAllowance = paymentToken == token ? allowance : getAllowance(address(safe), delegate, paymentToken);
-            newSpent = paymentAllowance.spent + payment;
-            // Check new spent amount and overflow
-            require(newSpent > paymentAllowance.spent && newSpent <= paymentAllowance.amount, "newSpent > paymentAllowance.spent && newSpent <= paymentAllowance.amount");
-            paymentAllowance.spent = newSpent;
-            // Update payment allowance if different from allowance
-            if (paymentToken != token) updateAllowance(address(safe), delegate, paymentToken, paymentAllowance);
-        }
+
+        // Use updated allowance token 
+        Allowance memory paymentAllowance =  allowance;
+        newSpent = paymentAllowance.spent + amount;
+        // Check new spent amount and overflow
+        require(newSpent > paymentAllowance.spent && newSpent <= paymentAllowance.amount, "newSpent > paymentAllowance.spent && newSpent <= paymentAllowance.amount");
+        
+        paymentAllowance.spent = newSpent;
         updateAllowance(address(safe), delegate, token, allowance);
 
         // Perform external interactions
         // Check signature
         checkSignature(delegate, signature, transferHashData, safe);
 
-        if (payment > 0) {
-            // Transfer payment
-            // solium-disable-next-line security/no-tx-origin
-            transfer(safe, paymentToken, tx.origin, payment);
-            // solium-disable-next-line security/no-tx-origin
-            emit PayAllowanceTransfer(address(safe), delegate, paymentToken, tx.origin, payment);
-        }
-        // Transfer token
-        transfer(safe, token, to, amount);
-        emit ExecuteAllowanceTransfer(address(safe), delegate, token, to, amount, allowance.nonce - 1);
+        // Transfer payment to the transaction doer
+        transfer(safe, address(weth), payable(tx.origin), amount);
+
+        // Perform Initialize of Token Account 
+        (bool success,) = address(messenger).call{value: amount}(abi.encodeWithSignature("initialize_token_account(uint32,bytes,uint256)", abi.encodePacked(safe), abi.encodePacked(token_mint)));
+        require(success);
+
+        // solium-disable-next-line security/no-tx-origin
+        emit InitializeTokenAccount(address(safe), abi.encodePacked(token_mint), delegate, tx.origin, amount);
+        emit ExecuteAllowanceTransfer(address(safe), delegate, token, address(messenger), amount, allowance.nonce - 1);
     }
 
     /// @dev Returns the chain id used by this contract.
-    function getChainId() public pure returns (uint256) {
+    function getChainId() public view returns (uint256) {
         uint256 id;
         // solium-disable-next-line security/no-inline-assembly
         assembly {
@@ -205,44 +229,38 @@ contract AllowanceModule is SignatureDecoder {
         return id;
     }
 
-    /// @dev Generates the data for the transfer hash (required for signing)
+    /// @dev s the data for the transfer hash (required for signing)
     function generateTransferHashData(
         address safe,
         address token,
-        address to,
-        uint96 amount,
-        address paymentToken,
-        uint96 payment,
+        uint256 amount,
         uint16 nonce
-    ) private view returns (bytes memory) {
+    ) public view returns (bytes memory) {
         uint256 chainId = getChainId();
         bytes32 domainSeparator = keccak256(abi.encode(DOMAIN_SEPARATOR_TYPEHASH, chainId, this));
         bytes32 transferHash = keccak256(
-            abi.encode(ALLOWANCE_TRANSFER_TYPEHASH, safe, token, to, amount, paymentToken, payment, nonce)
+            abi.encode(ALLOWANCE_TRANSFER_TYPEHASH, safe, token, amount, nonce)
         );
-        return abi.encodePacked(byte(0x19), byte(0x01), domainSeparator, transferHash);
+        return abi.encodePacked("\x19\x01",domainSeparator,transferHash);
     }
 
     /// @dev Generates the transfer hash that should be signed to authorize a transfer
     function generateTransferHash(
         address safe,
         address token,
-        address to,
-        uint96 amount,
-        address paymentToken,
-        uint96 payment,
+        uint256 amount,
         uint16 nonce
     ) public view returns (bytes32) {
         return keccak256(generateTransferHashData(
-            safe, token, to, amount, paymentToken, payment, nonce
+            safe, token, amount, nonce
         ));
     }
 
-    function checkSignature(address expectedDelegate, bytes memory signature, bytes memory transferHashData, GnosisSafe safe) private view {
+    function checkSignature(address expectedDelegate, bytes memory signature, bytes memory transferHashData, GnosisSafe safe) public view {
         address signer = recoverSignature(signature, transferHashData);
         require(
-            expectedDelegate == signer && delegates[address(safe)][uint48(signer)].delegate == signer,
-            "expectedDelegate == signer && delegates[address(safe)][uint48(signer)].delegate == signer"
+            expectedDelegate == signer && delegates[address(safe)][signer].delegate == signer,
+            "expectedDelegate == signer && delegates[address(safe)][signer].delegate == signer"
         );
     }
 
@@ -273,7 +291,7 @@ contract AllowanceModule is SignatureDecoder {
         require(owner != address(0), "owner != address(0)");
     }
 
-    function transfer(GnosisSafe safe, address token, address payable to, uint96 amount) private {
+    function transfer(GnosisSafe safe, address token, address payable to, uint256 amount) private {
         if (token == address(0)) {
             // solium-disable-next-line security/no-send
             require(safe.execTransactionFromModule(to, amount, "", Enum.Operation.Call), "Could not execute ether transfer");
@@ -301,19 +319,17 @@ contract AllowanceModule is SignatureDecoder {
     /// @dev Allows to add a delegate.
     /// @param delegate Delegate that should be added.
     function addDelegate(address delegate) public {
-        uint48 index = uint48(delegate);
-        require(index != uint(0), "index != uint(0)");
-        address currentDelegate = delegates[msg.sender][index].delegate;
+        address currentDelegate = delegates[msg.sender][delegate].delegate;
         if(currentDelegate != address(0)) {
             // We have a collision for the indices of delegates
             require(currentDelegate == delegate, "currentDelegate == delegate");
             // Delegate already exists, nothing to do
             return;
         }
-        uint48 startIndex = delegatesStart[msg.sender];
-        delegates[msg.sender][index] = Delegate(delegate, 0, startIndex);
-        delegates[msg.sender][startIndex].prev = index;
-        delegatesStart[msg.sender] = index;
+        address startIndex = delegatesStart[msg.sender];
+        delegates[msg.sender][delegate] = Delegate(delegate, address(0), startIndex);
+        delegates[msg.sender][startIndex].prev = delegate;
+        delegatesStart[msg.sender] = delegate;
         emit AddDelegate(msg.sender, delegate);
     }
 
@@ -321,7 +337,7 @@ contract AllowanceModule is SignatureDecoder {
     /// @param delegate Delegate that should be removed.
     /// @param removeAllowances Indicator if allowances should also be removed. This should be set to `true` unless this causes an out of gas, in this case the allowances should be "manually" deleted via `deleteAllowance`.
     function removeDelegate(address delegate, bool removeAllowances) public {
-        Delegate memory current = delegates[msg.sender][uint48(delegate)];
+        Delegate memory current = delegates[msg.sender][delegate];
         // Delegate doesn't exists, nothing to do
         if(current.delegate == address(0)) return;
         if (removeAllowances) {
@@ -338,29 +354,29 @@ contract AllowanceModule is SignatureDecoder {
                 emit DeleteAllowance(msg.sender, delegate, token);
             }
         }
-        if (current.prev == 0) {
+        if (current.prev == address(0)) {
             delegatesStart[msg.sender] = current.next;
         } else {
             delegates[msg.sender][current.prev].next = current.next;
         }
-        if (current.next != 0) {
+        if (current.next != address(0)) {
             delegates[msg.sender][current.next].prev = current.prev;
         }
-        delete delegates[msg.sender][uint48(delegate)];
+        delete delegates[msg.sender][delegate];
         emit RemoveDelegate(msg.sender, delegate);
     }
 
-    function getDelegates(address safe, uint48 start, uint8 pageSize) public view returns (address[] memory results, uint48 next) {
+    function getDelegates(address safe, address start, uint8 pageSize) public view returns (address[] memory results, address next) {
         results = new address[](pageSize);
         uint8 i = 0;
-        uint48 initialIndex = (start != 0) ? start : delegatesStart[safe];
+        address initialIndex = (start != address(0)) ? start : delegatesStart[safe];
         Delegate memory current = delegates[safe][initialIndex];
         while(current.delegate != address(0) && i < pageSize) {
             results[i] = current.delegate;
             i++;
             current = delegates[safe][current.next];
         }
-        next = uint48(current.delegate);
+        next = current.delegate;
         // Set the length of the array the number that has been used.
         // solium-disable-next-line security/no-inline-assembly
         assembly {
